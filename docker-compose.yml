@@ -1,0 +1,36 @@
+services:
+  cassandra:
+    image: cassandra:4.1
+    container_name: cassandra
+    ports:
+      - "9042:9042"
+    environment:
+      CASSANDRA_CLUSTER_NAME: "local"
+      JVM_OPTS: "-Xms1g -Xmx1g"
+    healthcheck:
+      test: ["CMD", "cqlsh", "-e", "DESCRIBE CLUSTER;"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+
+  mongo:
+    image: mongo:7
+    container_name: mongo
+    ports:
+      - "27017:27017"
+
+  redis:
+    image: redis:7
+    container_name: redis
+    ports:
+      - "6379:6379"
+
+  neo4j:
+    image: neo4j:5-community
+    container_name: neo4j
+    ports:
+      - "7474:7474" # browser
+      - "7687:7687" # bolt
+    environment:
+      - NEO4J_AUTH=neo4j/neo4jpassword
+      - NEO4J_dbms_security_auth__enabled=true
