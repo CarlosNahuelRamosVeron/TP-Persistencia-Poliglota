@@ -1,4 +1,3 @@
-
 import os
 from neo4j import GraphDatabase
 from dotenv import load_dotenv
@@ -10,6 +9,7 @@ NEO_USER = os.getenv("NEO_USER", "neo4j").strip()
 NEO_PASS = os.getenv("NEO_PASS", "neo4jpassword").strip()
 NEO_DB   = os.getenv("NEO_DB",   "neo4j").strip()
 
+# --- Funciones básicas de ejecución ---
 def run(tx, query, **params):
     return list(tx.run(query, **params))
 
@@ -19,10 +19,10 @@ def run_many(sess, statements):
         if q:
             sess.execute_write(run, q)
 
+# --- Bootstrap del modelo inicial ---
 def bootstrap_model():
     with GraphDatabase.driver(NEO_URI, auth=(NEO_USER, NEO_PASS)) as driver:
         with driver.session(database=NEO_DB) as sess:
-            # Neo4j 5 syntax (IF NOT EXISTS + REQUIRE)
             constraints = [
                 "CREATE CONSTRAINT role_id  IF NOT EXISTS FOR (r:Role)    REQUIRE r.id IS UNIQUE",
                 "CREATE CONSTRAINT user_id  IF NOT EXISTS FOR (u:User)    REQUIRE u.id IS UNIQUE",
@@ -50,10 +50,14 @@ def bootstrap_model():
             ]
             run_many(sess, deps)
 
+# --- Asignaciones ---
 def grant_all_to_admin():
     with GraphDatabase.driver(NEO_URI, auth=(NEO_USER, NEO_PASS)) as driver:
         with driver.session(database=NEO_DB) as sess:
-            sess.execute_write(run, "MATCH (r:Role {id:'admin'}), (p:Process) MERGE (r)-[:CAN_RUN]->(p)")
+            sess.execute_write(run, """
+            MATCH (r:Role {id:'admin'}), (p:Process)
+            MERGE (r)-[:CAN_RUN]->(p)
+            """)
 
 def create_user_with_role(userId: str, roleId: str):
     with GraphDatabase.driver(NEO_URI, auth=(NEO_USER, NEO_PASS)) as driver:
@@ -64,20 +68,42 @@ def create_user_with_role(userId: str, roleId: str):
             MERGE (u)-[:HAS_ROLE]->(r)
             """, uid=userId, rid=roleId)
 
+# --- Procesos accesibles (versión más clara y sin warnings) ---
 def processes_user_can_run(userId: str):
     with GraphDatabase.driver(NEO_URI, auth=(NEO_USER, NEO_PASS)) as driver:
         with driver.session(database=NEO_DB) as sess:
-            res = sess.execute_read(run, """
+            result = sess.execute_read(run, """
             MATCH (u:User {id:$uid})
-            OPTIONAL MATCH (u)-[:HAS_ROLE]->(r:Role)-[:CAN_RUN]->(p1:Process)
-            OPTIONAL MATCH (u)-[:MEMBER_OF]->(:Group)-[:CAN_RUN]->(p2:Process)
-            RETURN DISTINCT coalesce(p1,p2) AS proc ORDER BY proc.id
+            OPTIONAL MATCH (u)-[r]->(mid)-[:CAN_RUN]->(p:Process)
+            WHERE (type(r) = 'HAS_ROLE' AND mid:Role)
+               OR (type(r) = 'MEMBER_OF' AND mid:Group)
+            WITH DISTINCT p, type(r) AS via
+            RETURN p.id AS id, coalesce(p.name, p.id) AS nombre,
+                   CASE via WHEN 'HAS_ROLE' THEN 'Por rol'
+                            WHEN 'MEMBER_OF' THEN 'Por grupo'
+                            ELSE 'Otro' END AS acceso
+            ORDER BY acceso, id
             """, uid=userId)
-            return [r["proc"]["id"] for r in res if r["proc"]]
+            return [r.data() for r in result if r["id"]]
 
+def print_processes(rows):
+    if not rows:
+        print("Procesos habilitados: (ninguno)")
+        return
+    ancho = 60
+    print("\nProcesos habilitados")
+    print("=" * ancho)
+    print(f"{'ID':<24} {'Nombre':<26} {'Acceso':<10}")
+    print("-" * ancho)
+    for r in rows:
+        print(f"{r['id']:<24} {r['nombre']:<26} {r['acceso']:<10}")
+    print("=" * ancho)
+
+# --- MAIN ---
 if __name__ == "__main__":
     print(f"[neo4j] uri={NEO_URI} user={NEO_USER} db={NEO_DB} (pass=***)")
     bootstrap_model()
     grant_all_to_admin()
     create_user_with_role("usr_0001", "admin")
-    print("Procesos habilitados:", processes_user_can_run("usr_0001"))
+    procesos = processes_user_can_run("usr_0001")
+    print_processes(procesos)

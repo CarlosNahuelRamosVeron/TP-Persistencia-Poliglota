@@ -1,5 +1,5 @@
 #!/bin/sh
-'''exec' "/Users/nicom7910/Downloads/INGE DE DATOS 2025/TPO/TP-Persistencia-Poliglota/venv/bin/python3.11" "$0" "$@"
+'''exec' "/Users/nicom7910/Downloads/INGE DE DATOS 2025/Github TP/TP-Persistencia-Poliglota/venv/bin/python3.13" "$0" "$@"
 ' '''
 import sys
 from pip._internal.cli.main import main

@@ -2,6 +2,8 @@
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from datetime import datetime
 import os
+from pymongo.errors import DuplicateKeyError
+
 
 MONGO_URI = os.getenv("MONGO_URI","mongodb://localhost:27017")
 DB_NAME   = os.getenv("MONGO_DB","poliglot")
@@ -30,22 +32,53 @@ def bootstrap_indexes():
     db.accounts.create_index([("userId", ASCENDING)], unique=True)
 
 def create_user(email, fullName, passwordHash, roles=["usuario"]):
+    uid    = f"usr_{abs(hash(email))}"
+    acc_id = f"cta_{abs(hash(uid))}"
+    now    = datetime.utcnow()
+
+    # 1) Intentar crear el usuario (si ya existe por email/uid, lo reutilizamos)
     doc = {
-        "_id": f"usr_{abs(hash(email))}",
+        "_id": uid,
         "fullName": fullName,
         "email": email,
         "passwordHash": passwordHash,
         "status": "activo",
-        "registeredAt": datetime.utcnow(),
+        "registeredAt": now,
         "roles": roles,
-        "accountId": None
+        "accountId": acc_id
     }
-    db.users.insert_one(doc)
-    # abrir cuenta corriente
-    acc = {"_id": f"cta_{abs(hash(doc['_id']))}", "userId": doc["_id"], "balance": 0.0, "movements": []}
-    db.accounts.insert_one(acc)
-    db.users.update_one({"_id": doc["_id"]}, {"$set":{"accountId": acc["_id"]}})
-    return doc["_id"]
+    try:
+        db.users.insert_one(doc)
+    except DuplicateKeyError:
+        # Ya existe: solo aseguramos datos mínimos y NO fallamos
+        db.users.update_one(
+            {"_id": uid},
+            {"$set": {
+                "fullName": fullName,
+                "roles": roles,
+                "status": "activo"
+            },
+             "$setOnInsert": {
+                "email": email,
+                "passwordHash": passwordHash,
+                "registeredAt": now
+             }}
+        )
+    # 2) Asegurar cuenta corriente (upsert, no falla si ya existe)
+    db.accounts.update_one(
+        {"_id": acc_id},
+        {"$setOnInsert": {
+            "userId": uid,
+            "balance": 0.0,
+            "movements": []
+        }},
+        upsert=True
+    )
+    # 3) Asegurar que el user apunte a su cuenta
+    db.users.update_one({"_id": uid}, {"$set": {"accountId": acc_id}})
+
+    return uid
+
 
 def open_session(userId, role):
     ses = {"_id": f"ses_{abs(hash(userId+role+str(datetime.utcnow()))) }",
@@ -106,7 +139,7 @@ def register_payment(invoiceId, amount, method="tarjeta"):
 
 if __name__ == "__main__":
     bootstrap_indexes()
-    uid = create_user("juan@example.com", "Juan Garcia", "aadfg$demo", roles=["usuario"])
+    uid = create_user("nahuel@example.com", "Nahuel Veron", "cnrv$demo", roles=["usuario"])
     sid = open_session(uid, "usuario")
     define_process("proc_temp_max_min", "Max/Min por ciudad", "Informe de extremos", 10.0,
                    paramsSpec={"country":"string","city":"string","from":"date","to":"date","granularity":["daily","monthly"]})

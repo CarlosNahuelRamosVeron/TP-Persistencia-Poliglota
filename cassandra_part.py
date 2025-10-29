@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Optional, List, Dict
 import math
 import os
+from decimal import Decimal
 
 CASS_HOSTS = os.getenv("CASS_HOSTS","127.0.0.1").split(",")
 CASS_USER  = os.getenv("CASS_USER","cassandra")
@@ -13,7 +14,7 @@ KEYSPACE   = "iot"
 
 DDL = f"""
 CREATE KEYSPACE IF NOT EXISTS {KEYSPACE}
-WITH replication = {{'class': 'NetworkTopologyStrategy', 'DC1': 3}}
+WITH replication = {{'class': 'SimpleStrategy', 'replication_factor': 1}}
 AND durable_writes = true;
 
 CREATE TABLE IF NOT EXISTS {KEYSPACE}.sensor (
@@ -127,7 +128,7 @@ def query_sensor_range(s, sensor_id: str, start: datetime, end: datetime):
         rs = s.execute("""
            SELECT ts, temperature, humidity
            FROM measurement_by_sensor_month
-           WHERE sensor_id=%s AND yyyymm=%s AND ts >= %s AND ts < %s
+           WHERE sensor_id=%s AND yyyymm=%s AND ts >= %s AND ts <= %s
         """, (sensor_id, m, start, end))
         rows.extend(rs)
     return rows
@@ -156,6 +157,37 @@ def rollup_daily_for_city(s, country: str, city: str, day_yyyymmdd: int):
     """, (country, city, day_yyyymmdd, temp_min, temp_max, temp_avg, hum_min, hum_max, hum_avg, samples))
     return True
 
+
+
+def to_float(x):
+    return float(x) if isinstance(x, (Decimal, float, int)) else None
+
+def print_measurements(rows):
+    if not rows:
+        print("Mediciones recientes: (sin resultados)")
+        return
+    # encabezado
+    print("\nMediciones recientes")
+    print("-" * 44)
+    print(f"{'Hora (UTC)':<23} {'Temp (°C)':>10} {'Hum (%)':>9}")
+    print("-" * 44)
+    temps, hums = [], []
+    for r in rows:
+        t = to_float(r.temperature)
+        h = to_float(r.humidity)
+        if t is not None: temps.append(t)
+        if h is not None: hums.append(h)
+        print(f"{r.ts.strftime('%Y-%m-%d %H:%M:%S'):<23} "
+              f"{'' if t is None else f'{t:>10.2f}':>10} "
+              f"{'' if h is None else f'{h*100:>9.1f}':>9}")
+    print("-" * 44)
+    if temps:
+        print(f"Temp  -> min: {min(temps):.2f}  max: {max(temps):.2f}  avg: {sum(temps)/len(temps):.2f}")
+    if hums:
+        print(f"Humed -> min: {min(hums)*100:.1f}%  max: {max(hums)*100:.1f}%  avg: {sum(hums)/len(hums)*100:.1f}%")
+    print()
+
+
 if __name__ == "__main__":
     session = bootstrap_schema()
     upsert_sensor(session, {
@@ -165,5 +197,8 @@ if __name__ == "__main__":
     })
     now = datetime.utcnow()
     insert_measurement(session, "S-AR-0001", now, 22.8, 0.55, "Buenos Aires","AR")
-    print("Mediciones recientes:", list(query_sensor_range(session, "S-AR-0001", now.replace(hour=0,minute=0,second=0,microsecond=0), now)))
+    rows = list(query_sensor_range(session, "S-AR-0001",
+                               now.replace(hour=0, minute=0, second=0, microsecond=0),
+                               now))
+    print_measurements(rows)
     rollup_daily_for_city(session, "AR", "Buenos Aires", yyyymmdd(now))
