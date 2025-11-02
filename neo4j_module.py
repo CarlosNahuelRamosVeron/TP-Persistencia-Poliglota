@@ -1,4 +1,4 @@
-# neo4j_module.py — CLI para Bootstrap/Permisos/Consultas
+
 import os
 import argparse
 from typing import List, Dict
@@ -12,9 +12,6 @@ NEO_USER = os.getenv("NEO_USER", "neo4j").strip()
 NEO_PASS = os.getenv("NEO_PASS", "neo4jpassword").strip()
 NEO_DB   = os.getenv("NEO_DB",   "neo4j").strip()
 
-# -----------------------
-# Helpers Neo4j
-# -----------------------
 def run(tx, query, **params):
     return list(tx.run(query, **params))
 
@@ -27,9 +24,7 @@ def run_many(sess, statements):
 def get_driver():
     return GraphDatabase.driver(NEO_URI, auth=(NEO_USER, NEO_PASS))
 
-# -----------------------
-# Bootstrap / Seeds
-# -----------------------
+
 def bootstrap_model():
     with get_driver() as driver, driver.session(database=NEO_DB) as sess:
         constraints = [
@@ -62,9 +57,7 @@ def seed_minimal():
         ]
         run_many(sess, deps)
 
-# -----------------------
-# Operaciones de permisos
-# -----------------------
+
 def grant_all_to_admin():
     with get_driver() as driver, driver.session(database=NEO_DB) as sess:
         sess.execute_write(run, """
@@ -107,9 +100,7 @@ def grant_group_can_run(groupId: str, processId: str):
         MERGE (g)-[:CAN_RUN]->(p)
         """, gid=groupId, pid=processId)
 
-# -----------------------
-# Consultas
-# -----------------------
+
 Q_USER_PROCS = """
 MATCH (u:User {id:$uid})
 OPTIONAL MATCH (u)-[r]->(mid)-[:CAN_RUN]->(p:Process)
@@ -143,9 +134,7 @@ def list_processes() -> List[Dict]:
         res = sess.execute_read(run, "MATCH (p:Process) RETURN p.id AS id, coalesce(p.name,p.id) AS nombre ORDER BY id")
         return [x.data() for x in res]
 
-# -----------------------
-# Pretty print
-# -----------------------
+
 def print_table(rows: List[Dict], title: str, cols: List[str], widths: List[int]):
     if rows is None:
         rows = []
@@ -163,9 +152,7 @@ def print_table(rows: List[Dict], title: str, cols: List[str], widths: List[int]
 def print_processes(rows):
     print_table(rows, "Procesos habilitados", ["id", "nombre", "acceso"], [24, 28, 10])
 
-# -----------------------
-# CLI
-# -----------------------
+
 def build_parser():
     p = argparse.ArgumentParser(description="Neo4j CLI - Roles/Grupos/Permisos")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -215,12 +202,12 @@ def main():
 
     if args.cmd == "bootstrap":
         bootstrap_model()
-        print("Constraints OK ✅")
+        print("Constraints OK")
         return
 
     if args.cmd == "seed":
         seed_minimal()
-        print("Seeds OK ✅ (roles y procesos)")
+        print("Seeds OK (roles y procesos)")
         return
 
     if args.cmd == "create-user":
@@ -240,7 +227,7 @@ def main():
 
     if args.cmd == "grant-admin":
         grant_all_to_admin()
-        print("Rol admin puede ejecutar todos los procesos ✅")
+        print("Rol admin puede ejecutar todos los procesos")
         return
 
     if args.cmd == "grant-role":

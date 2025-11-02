@@ -1,4 +1,4 @@
-# cassandra_part.py — CLI listo para pruebas
+
 from cassandra.cluster import Cluster
 from cassandra.auth import PlainTextAuthProvider
 from datetime import datetime, timezone, timedelta
@@ -7,9 +7,7 @@ from decimal import Decimal
 import argparse
 import os
 
-# ---------------------------
-# Config
-# ---------------------------
+
 CASS_HOSTS = os.getenv("CASS_HOSTS", "127.0.0.1").split(",")
 CASS_USER  = os.getenv("CASS_USER", "cassandra")
 CASS_PASS  = os.getenv("CASS_PASS", "cassandra")
@@ -75,9 +73,7 @@ CREATE TABLE IF NOT EXISTS {KEYSPACE}.sensor_health (
 ) WITH CLUSTERING ORDER BY (checked_at DESC);
 """
 
-# ---------------------------
-# Helpers
-# ---------------------------
+
 BA_TZ = timezone(timedelta(hours=-3))  # Buenos Aires (UTC-3)
 
 def connect():
@@ -103,7 +99,6 @@ def to_float(x):
     return float(x) if isinstance(x, (Decimal, float, int)) else None
 
 def normalize_humidity(h) -> Optional[float]:
-    """Acepta 0..1 o 0..100 y devuelve 0..1; None si no válido."""
     if h is None:
         return None
     try:
@@ -116,9 +111,7 @@ def normalize_humidity(h) -> Optional[float]:
         return h / 100.0
     return None
 
-# ---------------------------
-# Core ops
-# ---------------------------
+
 def upsert_sensor(s, sensor: Dict):
     s.execute("""
     INSERT INTO sensor (sensor_id,name,type,lat,lon,city,country,status,started_at)
@@ -140,7 +133,7 @@ def insert_measurement(s, sensor_id: str, when: datetime, temperature: Optional[
     """, (country, city, m_yyyymmdd, when, sensor_id, temperature, humidity))
 
 def query_sensor_range(s, sensor_id: str, start: datetime, end: datetime):
-    # cubrir salto de mes
+    
     months = set([yyyymm(start)])
     cursor = datetime(start.year, start.month, 1)
     while cursor <= end:
@@ -184,9 +177,7 @@ def rollup_daily_for_city(s, country: str, city: str, day_yyyymmdd: int):
     """, (country, city, day_yyyymmdd, temp_min, temp_max, temp_avg, hum_min, hum_max, hum_avg, samples))
     return True
 
-# ---------------------------
-# Pretty print (hora local BA)
-# ---------------------------
+
 def print_measurements(rows, use_ba_time: bool = True):
     if not rows:
         print("Mediciones recientes: (sin resultados)")
@@ -217,15 +208,13 @@ def print_measurements(rows, use_ba_time: bool = True):
         print(f"Humed -> min: {min(hums)*100:.1f}%  max: {max(hums)*100:.1f}%  avg: {sum(hums)/len(hums)*100:.1f}%")
     print()
 
-# ---------------------------
-# CLI
-# ---------------------------
+
 def build_parser():
     p = argparse.ArgumentParser(description="Cassandra IoT CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s_boot = sub.add_parser("bootstrap", help="Crear keyspace y tablas")
-    # sin args
+
 
     s_up = sub.add_parser("upsert-sensor", help="Crear/actualizar un sensor")
     s_up.add_argument("--sensor-id", required=True)
@@ -258,30 +247,25 @@ def build_parser():
     s_ru.add_argument("--yyyymmdd", type=int, required=True)
 
     s_demo = sub.add_parser("demo", help="Demo rápida: crea sensor, inserta una medición y consulta")
-    # sin args
+    
 
     return p
 
 def parse_local_ba(ts_str: Optional[str]) -> datetime:
-    """Recibe 'YYYY-MM-DD HH:MM:SS' o ISO; asume hora local BA y devuelve UTC naive."""
     if not ts_str:
         return datetime.utcnow()
-    # Permitir 'YYYY-MM-DD' solo fecha -> 12:00 local para evitar borde
     try:
         if len(ts_str.strip()) == 10:
             dt_local = datetime.strptime(ts_str.strip(), "%Y-%m-%d").replace(hour=12, minute=0, second=0)
         else:
-            # intentar con segundos o sin segundos
             try:
                 dt_local = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
             except ValueError:
                 dt_local = datetime.strptime(ts_str, "%Y-%m-%d %H:%M")
-        # marcar como BA local y convertir a UTC
         dt_local = dt_local.replace(tzinfo=BA_TZ)
         dt_utc = dt_local.astimezone(timezone.utc).replace(tzinfo=None)
         return dt_utc
     except Exception:
-        # fallback: ahora UTC
         return datetime.utcnow()
 
 def main():
@@ -313,7 +297,6 @@ def main():
         return
 
     if args.cmd == "query":
-        # rango por defecto: hoy 00:00 BA -> ahora
         if args.date_from:
             start_utc = parse_local_ba(args.date_from + " 00:00:00")
         else:
@@ -336,7 +319,6 @@ def main():
         return
 
     if args.cmd == "demo":
-        # Crea un sensor en el Obelisco, inserta medición ahora y consulta el día
         sensor_id = "S-AR-0001"
         upsert_sensor(s, {
             "sensor_id": sensor_id, "name": "Obelisco", "type": "mixto",

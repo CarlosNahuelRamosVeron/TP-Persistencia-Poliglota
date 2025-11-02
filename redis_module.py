@@ -1,33 +1,21 @@
-# redis_module.py — CLI listo para pruebas
+
 import os, json, time, argparse
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Any
 from redis import Redis
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-r = Redis.from_url(REDIS_URL, decode_responses=True)  # decode to str
+r = Redis.from_url(REDIS_URL, decode_responses=True)
 
-# Namespaces / keys:
-# alerts:queue (Stream), alerts:active (ZSET), alert:{id} (HASH)
-# sessions:{token} (HASH with TTL), usage:{userId}:{yyyyMM} (COUNTER)
 
-# ---------------------------
-# Time helpers (Buenos Aires)
-# ---------------------------
 BA_TZ = timezone(timedelta(hours=-3))
 
 def parse_when_to_epoch(when: Optional[str]) -> int:
-    """Convierte 'when' a epoch (segundos). Acepta:
-       - None -> now()
-       - entero (string) -> epoch
-       - ISO 'YYYY-MM-DD [HH:MM[:SS]]' interpretado en hora local BA
-    """
     if not when:
         return int(time.time())
     when = str(when).strip()
     if when.isdigit():
         return int(when)
-    # ISO local BA
     try:
         if len(when) == 10:
             dt_local = datetime.strptime(when, "%Y-%m-%d").replace(hour=12, minute=0, second=0)
@@ -44,18 +32,14 @@ def parse_when_to_epoch(when: Optional[str]) -> int:
         dt_utc = dt_local.astimezone(timezone.utc)
         return int(dt_utc.timestamp())
     except Exception:
-        # fallback: ahora
         return int(time.time())
 
 def fmt_epoch_local(epoch: int) -> str:
     dt = datetime.fromtimestamp(epoch, tz=timezone.utc).astimezone(BA_TZ)
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
-# ---------------------------
-# Core API
-# ---------------------------
+
 def push_alert(alert_id: str, at_epoch: int, payload: Dict[str, Any]):
-    # Guardar detalle
     r.hset(f"alert:{alert_id}", mapping={
         "type": payload.get("type", "sensor"),
         "sensor_id": payload.get("sensor_id", ""),
@@ -63,9 +47,7 @@ def push_alert(alert_id: str, at_epoch: int, payload: Dict[str, Any]):
         "desc": payload.get("desc", ""),
         "state": "activa"
     })
-    # Rank temporal
     r.zadd("alerts:active", {f"alert:{alert_id}": at_epoch})
-    # Encolar evento (stream)
     r.xadd("alerts:queue", {"id": alert_id, "json": json.dumps(payload)})
 
 def resolve_alert(alert_id: str):
@@ -90,14 +72,11 @@ def get_usage(userId: str, yyyymm: str) -> int:
     v = r.get(f"usage:{userId}:{yyyymm}")
     return int(v) if v else 0
 
-# ---------------------------
-# CLI
-# ---------------------------
+
 def build_parser():
     p = argparse.ArgumentParser(description="Redis CLI - Alerts/Sessions/Usage")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    # Alerts
     a1 = sub.add_parser("push-alert", help="Crear alerta y encolarla")
     a1.add_argument("--id", required=True, help="alert_id")
     a1.add_argument("--type", default="sensor")
@@ -116,7 +95,6 @@ def build_parser():
     a4.add_argument("--block-ms", type=int, default=2000)
     a4.add_argument("--from-id", default="$", help="Use '0-0' para leer histórico, '$' para nuevos")
 
-    # Sessions
     s1 = sub.add_parser("cache-session", help="Cachear sesión con TTL")
     s1.add_argument("--token", required=True)
     s1.add_argument("--user", required=True)
@@ -128,7 +106,6 @@ def build_parser():
     s3 = sub.add_parser("del-session", help="Eliminar sesión")
     s3.add_argument("--token", required=True)
 
-    # Usage
     u1 = sub.add_parser("incr-usage", help="Incrementar uso")
     u1.add_argument("--user", required=True)
     u1.add_argument("--yyyymm", required=True)
@@ -138,9 +115,8 @@ def build_parser():
     u2.add_argument("--user", required=True)
     u2.add_argument("--yyyymm", required=True)
 
-    # Misc
     st = sub.add_parser("stats", help="Resumen de estado")
-    fl = sub.add_parser("flush", help="⚠️ Borra claves del namespace (alerts/sessions/usage)")
+    fl = sub.add_parser("flush", help="Borra claves del namespace (alerts/sessions/usage)")
 
     return p
 
@@ -160,7 +136,6 @@ def main():
         return
 
     if args.cmd == "list-alerts":
-        # ordenar por score (epoch) descendente
         items = r.zrevrange("alerts:active", 0, args.limit - 1, withscores=True)
         if not items:
             print("No hay alertas activas")
@@ -171,7 +146,7 @@ def main():
         print(f"{'ID':<20} {'Tipo':<10} {'Sensor':<14} {'Estado':<10} {'Fecha (BA)':<20} {'Epoch':>10}")
         print("-" * ancho)
         for key, score in items:
-            alert_key = key  # ej: alert:alr_0001
+            alert_key = key
             aid = alert_key.split("alert:", 1)[-1]
             h = r.hgetall(alert_key)
             tipo = h.get("type", "")
@@ -183,7 +158,7 @@ def main():
         return
 
     if args.cmd == "tail-queue":
-        # XREAD bloqueante corto
+        
         items = r.xread({"alerts:queue": args.from_id}, count=args.count, block=args.block_ms)
         if not items:
             print("(sin eventos nuevos)")
@@ -231,7 +206,6 @@ def main():
 
     if args.cmd == "stats":
         n_alerts = r.zcard("alerts:active")
-        # sesiones vivas (estimación por key scan)
         n_sessions = sum(1 for _ in r.scan_iter("sessions:*"))
         n_usage = sum(1 for _ in r.scan_iter("usage:*"))
         print(f"Redis @ {REDIS_URL}")
@@ -241,7 +215,7 @@ def main():
         return
 
     if args.cmd == "flush":
-        # Borrado acotado a nuestro namespace
+        
         deleted = 0
         for pattern in ("alert:*", "alerts:active", "alerts:queue", "sessions:*", "usage:*"):
             for k in r.scan_iter(pattern):
