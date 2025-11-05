@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 import os
 import hashlib
@@ -17,7 +16,6 @@ def _db():
     return MongoClient(MONGO_URI)[MONGO_DB]
 
 def _uid_from_email(email: str) -> str:
-    """ID estable derivado del email (evita duplicados al hacer upsert)."""
     base = email.strip().lower().encode("utf-8")
     return "usr_" + hashlib.sha1(base).hexdigest()[:12]
 
@@ -79,7 +77,7 @@ def bootstrap_indexes():
 
 # Roles
 def create_role(name: str, permissions: List[str]) -> Dict[str, Any]:
-    """Crea/actualiza un rol (idempotente)."""
+    # Crea/actualiza un rol
     bootstrap_indexes()
     db = _db()
     doc = {"name": name, "permissions": sorted(set(permissions)), "created_at": _now()}
@@ -145,36 +143,24 @@ def assign_role(email: str, role: str) -> Dict[str, Any]:
     updated.pop("password", None)
     return updated
 
-def remove_role(email: str, role: str) -> Dict[str, Any]:
-    db = _db()
-    updated = db.users.find_one_and_update(
-        {"email": email.strip().lower()},
-        {"$pull": {"roles": role}, "$set": {"updated_at": _now()}},
-        return_document=ReturnDocument.AFTER,
-    )
-    if not updated:
-        raise ValueError("Usuario no encontrado")
-    updated.pop("password", None)
-    return updated
-
 def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
-    u = _db().users.find_one({"email": email.strip().lower()})
+    db = _db()
+    email_n = email.strip().lower()
+    u = db.users.find_one({"email": email_n})
     if not u:
         return None
+    if "user_id" not in u or not u.get("user_id"):
+        try:
+            uid = _uid_from_email(email_n)
+            u = db.users.find_one_and_update(
+                {"_id": u["_id"]},
+                {"$set": {"user_id": uid, "updated_at": _now()}},
+                return_document=ReturnDocument.AFTER,
+            )
+        except Exception:
+            u["user_id"] = _uid_from_email(email_n)
     u.pop("password", None)
     return u
-
-def check_permission(user_email: str, permission: str) -> bool:
-    """Evalúa permisos por unión de permisos de roles del usuario."""
-    db = _db()
-    u = db.users.find_one({"email": user_email.strip().lower()})
-    if not u:
-        return False
-    role_names = u.get("roles", [])
-    perms = set()
-    for r in db.roles.find({"name": {"$in": role_names}}):
-        perms.update(r.get("permissions", []))
-    return permission in perms
 
 
 # Seed roles básicos

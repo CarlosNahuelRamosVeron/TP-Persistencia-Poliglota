@@ -1,4 +1,3 @@
-
 from cassandra.cluster import Cluster
 from cassandra.auth import PlainTextAuthProvider
 from datetime import datetime, timezone, timedelta
@@ -112,6 +111,62 @@ def normalize_humidity(h) -> Optional[float]:
     return None
 
 
+_SESSION = None
+
+def get_session():
+    """Devuelve una sesión de Cassandra con el keyspace seteado y la reutiliza."""
+    global _SESSION
+    if _SESSION is None:
+        _SESSION = bootstrap_schema()
+    return _SESSION
+
+def _iter_days(year: int, month: int):
+    import calendar
+    last = calendar.monthrange(year, month)[1]
+    for d in range(1, last + 1):
+        yield year * 10000 + month * 100 + d
+
+def get_avg_temp_hum(session, country: str, city: str, year: int, month: int) -> Dict[str, Optional[float]]:
+    """
+    Calcula promedio mensual de temperatura y humedad para una ciudad
+    leyendo las mediciones crudas en measurement_by_city_day.
+    Devuelve: {'temp_avg','hum_avg','temp_samples','hum_samples',...}
+    """
+    temps: List[float] = []
+    hums:  List[float] = []
+    for yyyymmdd in _iter_days(year, month):
+        rs = session.execute(
+            """
+            SELECT temperature, humidity
+            FROM measurement_by_city_day
+            WHERE country=%s AND city=%s AND yyyymmdd=%s
+            """,
+            (country, city, yyyymmdd),
+        )
+        for r in rs:
+            if r.temperature is not None:
+                try:
+                    temps.append(float(r.temperature))
+                except Exception:
+                    pass
+            if r.humidity is not None:
+                try:
+                    hums.append(float(r.humidity))
+                except Exception:
+                    pass
+
+    return {
+        "country": country,
+        "city": city,
+        "year": year,
+        "month": month,
+        "temp_avg": (sum(temps) / len(temps)) if temps else None,
+        "hum_avg":  (sum(hums)  / len(hums))  if hums  else None,
+        "temp_samples": len(temps),
+        "hum_samples":  len(hums),
+    }
+
+
 def upsert_sensor(s, sensor: Dict):
     s.execute("""
     INSERT INTO sensor (sensor_id,name,type,lat,lon,city,country,status,started_at)
@@ -133,12 +188,12 @@ def insert_measurement(s, sensor_id: str, when: datetime, temperature: Optional[
     """, (country, city, m_yyyymmdd, when, sensor_id, temperature, humidity))
 
 def query_sensor_range(s, sensor_id: str, start: datetime, end: datetime):
-    
     months = set([yyyymm(start)])
     cursor = datetime(start.year, start.month, 1)
+    # cubrir hasta el primer día del mes siguiente a 'end'
     while cursor <= end:
         months.add(yyyymm(cursor))
-        cursor = cursor.replace(day=1)
+        # avanzar 1 mes
         m = cursor.month + 1
         y = cursor.year + (1 if m == 13 else 0)
         m = 1 if m == 13 else m
@@ -209,12 +264,76 @@ def print_measurements(rows, use_ba_time: bool = True):
     print()
 
 
+def get_all_sensors(session):
+    return session.execute("SELECT sensor_id, name FROM iot.sensor")
+
+class _RowWhen:
+    def __init__(self, when_utc): self.when_utc = when_utc
+
+def _latest_measurement_for_month(session, sensor_id: str, yyyymm_val: int):
+    rs = session.execute(
+        """
+        SELECT ts FROM measurement_by_sensor_month
+        WHERE sensor_id=%s AND yyyymm=%s
+        ORDER BY ts DESC
+        LIMIT 1
+        """,
+        [sensor_id, yyyymm_val]
+    )
+    row = rs.one()
+    return row.ts if row else None
+
+def get_last_measurement(session, sensor_id):
+    now = datetime.utcnow()
+    cur = now.year * 100 + now.month
+    pm  = 12 if now.month == 1 else now.month - 1
+    py  = now.year - 1 if now.month == 1 else now.year
+    prv = py * 100 + pm
+
+    ts_cur = _latest_measurement_for_month(session, sensor_id, cur)
+    ts_prv = _latest_measurement_for_month(session, sensor_id, prv)
+
+    latest = ts_cur if (ts_cur and (not ts_prv or ts_cur >= ts_prv)) else ts_prv
+    return _RowWhen(latest) if latest else None
+
+class _RowRecent:
+    def __init__(self, sensor_id, temp_c):
+        self.sensor_id = sensor_id
+        self.temp_c = temp_c
+
+def get_recent_measurements(session, hours=1):
+    cutoff = datetime.utcnow() - timedelta(hours=hours)
+
+    sensor_ids = [r.sensor_id for r in session.execute("SELECT sensor_id FROM sensor")]
+
+    y = cutoff.year; m = cutoff.month
+    cur = y*100 + m
+    pm  = 12 if m == 1 else m-1
+    py  = y-1 if m == 1 else y
+    prv = py*100 + pm
+
+    out: List[_RowRecent] = []
+    for sid in sensor_ids:
+        for part in (cur, prv):
+            rs = session.execute(
+                """
+                SELECT temperature
+                FROM measurement_by_sensor_month
+                WHERE sensor_id=%s AND yyyymm=%s AND ts >= %s
+                ALLOW FILTERING
+                """,
+                [sid, part, cutoff]
+            )
+            for r in rs:
+                out.append(_RowRecent(sid, to_float(r.temperature)))
+    return out
+
+
 def build_parser():
     p = argparse.ArgumentParser(description="Cassandra IoT CLI")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s_boot = sub.add_parser("bootstrap", help="Crear keyspace y tablas")
-
 
     s_up = sub.add_parser("upsert-sensor", help="Crear/actualizar un sensor")
     s_up.add_argument("--sensor-id", required=True)
@@ -247,8 +366,6 @@ def build_parser():
     s_ru.add_argument("--yyyymmdd", type=int, required=True)
 
     s_demo = sub.add_parser("demo", help="Demo rápida: crea sensor, inserta una medición y consulta")
-    
-
     return p
 
 def parse_local_ba(ts_str: Optional[str]) -> datetime:

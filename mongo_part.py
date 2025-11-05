@@ -190,6 +190,45 @@ def register_payment(invoiceId, amount, method="tarjeta"):
     print(f"Pago registrado {pay['_id']} por ${amount} usando {method}")
     return pay["_id"]
 
+def insert_alerts(alerts):
+    coll = db["alerts"]
+    coll.insert_many(alerts)
+
+
+def update_process_state(request_id: str, state: str, payload=None, notes: str = "") -> str:
+    """
+    Registra el estado final de un proceso (request) creando una 'execution' y
+    actualiza el estado de la request.
+      - state: "completed" | "failed"
+      - payload: dict/obj con el resultado (ej. promedios), opcional
+    Devuelve exec_id.
+    """
+    now = datetime.utcnow()
+    status_exec = "ok" if state == "completed" else "fallido"
+    status_req  = "completado" if state == "completed" else "fallido"
+
+    exec_id = f"exec_{abs(hash((request_id, now.isoformat(), status_exec)))}"
+    exec_doc = {
+        "_id": exec_id,
+        "requestId": request_id,
+        "startedAt": now,        # simple: misma hora para start/finish
+        "finishedAt": now,
+        "status": status_exec,   # "ok" | "fallido"
+        "resultLocation": None,
+        "meteredUnits": 0,
+        "notes": notes,
+    }
+    if payload is not None:
+        exec_doc["payload"] = payload
+
+    db.executions.insert_one(exec_doc)
+    db.requests.update_one(
+        {"_id": request_id},
+        {"$set": {"status": status_req, "updatedAt": now}}
+    )
+    return exec_id
+
+
 
 def build_parser():
     parser = argparse.ArgumentParser(description="MongoDB CLI - Poliglota (procesos/billing)")

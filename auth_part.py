@@ -48,12 +48,6 @@ def bootstrap_indexes():
     s.create_index([("user_id", ASCENDING), ("active", ASCENDING)], name="ix_sessions_user_active")
 
 def _migrate_legacy_password_if_needed(u: Dict[str, Any], plain_pwd: str) -> Dict[str, Any]:
-    #Si el usuario tiene password en formato legado:
-    #   'password' como string plano, o
-    #   'passwordHash' como string
-    #y coincide con 'plain_pwd', migra a dict {'hash','salt','iterations'}.
-    #Devuelve el documento posiblemente actualizado.
-    
     if isinstance(u.get("password"), dict):
         return u
 
@@ -73,12 +67,6 @@ def _migrate_legacy_password_if_needed(u: Dict[str, Any], plain_pwd: str) -> Dic
 
 
 def login(email: str, password: str, role_override: Optional[str] = None) -> Dict[str, Any]:
-    #Inicia sesión con email/password.
-    #Migra password legado si corresponde.
-    #Crea sesión en Mongo y cachea la sesión con TTL.
-    #Retorna: {session_id, user_id, email, roles, started_at}
-    
-    
     users_bootstrap()
     bootstrap_indexes()
 
@@ -87,7 +75,6 @@ def login(email: str, password: str, role_override: Optional[str] = None) -> Dic
     if not u:
         raise ValueError("Usuario inexistente o inactivo")
 
-    # Migración si venía de un esquema viejo
     u = _migrate_legacy_password_if_needed(u, password)
 
     pwd_info = u.get("password")
@@ -101,7 +88,14 @@ def login(email: str, password: str, role_override: Optional[str] = None) -> Dic
     if role_override and role_override in roles:
         roles = [role_override]
 
-    sid = "ses_" + uuid.uuid4().hex[:16]
+    doc = db.counters.find_one_and_update(
+    {"_id": "sessions"},
+    {"$inc": {"seq": 1}},
+    upsert=True,
+    return_document=True
+)
+    sid = int(doc.get("seq", 1))
+
     sess = {
         "session_id": sid,
         "user_id": u.get("user_id"),

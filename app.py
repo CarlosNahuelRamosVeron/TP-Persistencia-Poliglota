@@ -80,10 +80,61 @@ def build_parser():
     p.add_argument("--no-invoice", action="store_true", help="No emitir factura ni registrar pago")
     return p
 
+def run_monthly_avg_report(user_id, country, city, year, month):
+    """
+    Genera promedio mensual de temperatura y humedad (por ciudad y mes).
+    Guarda el resultado en el estado del proceso en Mongo.
+    Devuelve un dict con ok / datos básicos.
+    """
+    last_day  = calendar.monthrange(year, month)[1]
+    date_from = f"{year}-{month:02d}-01"
+    date_to   = f"{year}-{month:02d}-{last_day:02d}"
+
+    # índices y request del proceso
+    mon.bootstrap_indexes()
+    req_id = mon.request_process(
+        user_id,
+        "proc_temp_promedio",
+        {
+            "country": country,
+            "city": city,
+            "from": date_from,
+            "to": date_to,
+            "granularity": "monthly",
+        },
+    )
+
+    # cálculo en Cassandra
+    sess = cas.get_session()
+    summary = cas.get_avg_temp_hum(sess, country, city, year, month)  # {'temp_avg','hum_avg','temp_samples','hum_samples',...}
+
+    # si no hay ninguna muestra (temp ni hum), marcamos como fallido
+    no_temp = summary.get("temp_samples", 0) == 0
+    no_hum  = summary.get("hum_samples", 0) == 0
+    if no_temp and no_hum:
+        mon.update_process_state(req_id, "failed", "sin datos")
+        print("Reporte fallido: sin datos.")
+        return {"ok": False, "req_id": req_id, "error": "sin datos", "from": date_from, "to": date_to}
+
+    # éxito
+    mon.update_process_state(req_id, "completed", summary)
+    print("Reporte promedio completado.")
+    return {
+        "ok": True,
+        "req_id": req_id,
+        "from": date_from,
+        "to": date_to,
+        "city": city,
+        "country": country,
+        "temp_avg": summary.get("temp_avg"),
+        "hum_avg": summary.get("hum_avg"),
+        "temp_samples": summary.get("temp_samples", 0),
+        "hum_samples": summary.get("hum_samples", 0),
+    }
+
+
 def main():
     args = build_parser().parse_args()
-
-
     ensure_process_catalog()
 
 

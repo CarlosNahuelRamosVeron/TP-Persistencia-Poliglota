@@ -8,6 +8,9 @@ import cassandra_part as cas
 import mongo_part as mon
 import redis_module as rds
 import neo4j_module as neo
+import alerts_part as al
+import app
+import math, random
 
 from users_part import (
     bootstrap_indexes as user_bootstrap,
@@ -25,15 +28,19 @@ from messaging_part import (
     mark_as_read,
 )
 
-
+# --------------------------------------------------------------------
+# Config/constantes
+# --------------------------------------------------------------------
 BA_TZ = timezone(timedelta(hours=-3))
 
 PROCESS_ID    = "proc_temp_max_min"
 PROCESS_NAME  = "Max/Min por ciudad"
 PROCESS_DESC  = "Informe de extremos"
-PROCESS_PRICE = 10.0
+PROCESS_PRICE = 10.0  # (queda para catálogo; NO se factura)
 
-
+# --------------------------------------------------------------------
+# Helpers generales
+# --------------------------------------------------------------------
 def ask(prompt, default=None, cast=str):
     txt = input(f"{prompt}" + (f" [{default}]" if default is not None else "") + ": ").strip()
     if not txt and default is not None:
@@ -67,7 +74,6 @@ def guard(fn, success_msg=None):
         traceback.print_exc(limit=1)
         return None
 
-
 def _user_by_email(email: str):
     u = get_user_by_email(email)
     if not u:
@@ -78,8 +84,9 @@ def _require_perm(session_id: str, perm: str):
     if not session_has_permission(session_id, perm):
         raise PermissionError(f"Permiso requerido: {perm}")
 
-
+# --------------------------------------------------------------------
 # Catálogo de procesos (Mongo)
+# --------------------------------------------------------------------
 def ensure_process_catalog():
     mon.define_process(
         PROCESS_ID,
@@ -89,8 +96,10 @@ def ensure_process_catalog():
         paramsSpec={"country": "string", "city": "string", "from": "date", "to": "date", "granularity": ["daily", "monthly"]},
     )
 
-
-# Reporte mensual (Cassandra + Mongo + Redis)
+# --------------------------------------------------------------------
+# Reporte mensual (extremos) - Cassandra + Mongo + Redis
+# (Se deja acá para que el menú sea autocontenido. Si preferís, movelo a app.py)
+# --------------------------------------------------------------------
 def run_monthly_city_report(user_id: str, country: str, city: str, year: int, month: int):
     last_day = calendar.monthrange(year, month)[1]
     date_from = f"{year}-{month:02d}-01"
@@ -126,7 +135,7 @@ def run_monthly_city_report(user_id: str, country: str, city: str, year: int, mo
         exec_id = mon.record_execution(
             req_id,
             ok=True,
-            resultLocation="s3://fake/report.pdf",
+            resultLocation="s3://fake/report.pdf",  # placeholder
             meteredUnits=len(results),
         )
         try:
@@ -147,7 +156,9 @@ def run_monthly_city_report(user_id: str, country: str, city: str, year: int, mo
         mon.record_execution(req_id, ok=False, notes="No hay datos en el rango")
         return {"ok": False, "req_id": req_id, "error": "sin datos", "from": date_from, "to": date_to}
 
+# --------------------------------------------------------------------
 # Opciones originales (infra/reportes)
+# --------------------------------------------------------------------
 def run_cmd(cmd: str):
     try:
         out = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT)
@@ -166,7 +177,6 @@ def wait_port(host: str, port: int, timeout=30):
             time.sleep(1)
     return False
 
-
 def opt_1_bootstrap_all():
     print("\n== 🔧 Iniciando entorno de bases de datos ==")
 
@@ -176,7 +186,6 @@ def opt_1_bootstrap_all():
         print(run_cmd("docker compose up -d"))
         time.sleep(5)
     else:
-        # Intento de inicio manual/local
         print("No se detectó docker-compose.yml, intento levantar motores locales o contenedores existentes.")
 
         # Mongo
@@ -199,7 +208,6 @@ def opt_1_bootstrap_all():
             print("→ Neo4j no responde; intentando docker…")
             run_cmd("docker start neo4j 2>/dev/null || true")
 
-        # Esperar unos segundos a que arranquen
         print("Esperando que los motores se inicialicen (10s)…")
         time.sleep(10)
 
@@ -228,48 +236,107 @@ def opt_1_bootstrap_all():
     print_ok("Entorno inicial preparado")
 
 
-def opt_2_cassandra_demo():
+
+def opt_2_cassandra():
     s = guard(cas.bootstrap_schema)
     if not s:
         return
-    sensor_id = "S-AR-0001"
+
+    print("\n=== Cassandra: ===")
+
+    # Parámetros básicos
+    country = ask("País (ISO2)", "AR")
+    city    = ask("Ciudad", "Buenos Aires")
+    sensor_name = ask("Nombre del sensor", f"Sensor {city}")
+    sensor_id   = ask("Sensor ID", f"S-{country}-{city[:3].upper()}-001")
+
+    # Rango temporal e intervalo
+    default_start = now_ba().replace(minute=0, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M")
+    start_local_s = ask("Fecha/hora inicial (BA) YYYY-MM-DD HH:MM", default_start)
+    hours         = ask("Cantidad de horas a generar", "24", int)
+    interval_min  = ask("Intervalo (minutos) entre mediciones", "60", int)
+
+    # Parámetros de generación (temp/humedad)
+    base_temp = ask("Temp base (°C)", "22.0", float)
+    amp_temp  = ask("Amplitud temp (±°C)", "5.0", float)
+    base_hum  = ask("Humedad base (0..1 o 0..100)", "60", float)
+    amp_hum   = ask("Amplitud hum (± en mismas unidades)", "10", float)
+
+    def parse_local_ba(s):
+        parse_fn = cas.__dict__.get("parse_local_ba")
+        if callable(parse_fn):
+            return parse_fn(s)
+        dt_ba = datetime.strptime(s, "%Y-%m-%d %H:%M").replace(tzinfo=BA_TZ)
+        return dt_ba.astimezone(timezone.utc).replace(tzinfo=None)
+
+    def to_utc_naive(dt_ba):
+        return dt_ba.astimezone(timezone.utc).replace(tzinfo=None)
     guard(
         lambda: cas.upsert_sensor(
             s,
             {
                 "sensor_id": sensor_id,
-                "name": "Obelisco",
+                "name": sensor_name,
                 "type": "mixto",
-                "lat": -34.6037,
-                "lon": -58.3816,
-                "city": "Buenos Aires",
-                "country": "AR",
+                "city": city,
+                "country": country,
                 "status": "activo",
                 "started_at": datetime.utcnow(),
             },
         ),
-        "Sensor asegurado",
-    )
-    when_local = ask("Fecha/hora (BA) YYYY-MM-DD HH:MM[:SS]", now_ba().strftime("%Y-%m-%d %H:%M:%S"))
-    temp = ask("Temperatura °C", "22.8", float)
-    hum = ask("Humedad (0..1 o 0..100)", "55", float)
-
-    when_utc = cas.__dict__.get("parse_local_ba")(when_local) if "parse_local_ba" in cas.__dict__ else datetime.utcnow()
-    hum_norm = cas.normalize_humidity(hum)
-    guard(
-        lambda: cas.insert_measurement(s, sensor_id, when_utc, temp, hum_norm, "Buenos Aires", "AR"),
-        "Medición insertada",
+        f"Sensor asegurado: {sensor_id} / {city}, {country}",
     )
 
-    start_ba = now_ba().replace(hour=0, minute=0, second=0, microsecond=0)
-    start_utc = start_ba.astimezone(timezone.utc).replace(tzinfo=None)
-    rows = list(cas.query_sensor_range(s, sensor_id, start_utc, datetime.utcnow()))
-    cas.print_measurements(rows, use_ba_time=True)
+    # Generación e inserción
+    start_utc = parse_local_ba(start_local_s)
+    steps = max(1, (hours * 60) // max(1, interval_min))
+    print(f"Insertando {steps} mediciones desde {start_local_s} (BA), cada {interval_min} min...")
+
+    ok, fail = 0, 0
+    for i in range(steps):
+        #t_ba  = now_ba().replace(hour=0, minute=0, second=0, microsecond=0)  # no usamos esto para el cálculo
+        t_utc = start_utc + timedelta(minutes=i * interval_min)
+
+        phase = (i / max(1, steps-1)) * 2 * math.pi
+        temp  = base_temp + math.sin(phase) * amp_temp + random.uniform(-0.5, 0.5)
+        hum_v = base_hum  + math.cos(phase) * amp_hum  + random.uniform(-1.0, 1.0)
+
+        try:
+            hum_norm = cas.normalize_humidity(hum_v)
+        except Exception:
+            hum_norm = hum_v/100.0 if hum_v > 1.0 else hum_v
+            hum_norm = max(0.0, min(1.0, hum_norm))
+
+        try:
+            cas.insert_measurement(s, sensor_id, t_utc, temp, hum_norm, city, country)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            print(f"[WARN] No se pudo insertar medición #{i+1}: {e}")
+
+    print(f"Listo. Insertadas OK: {ok} | Fallidas: {fail}")
+
+    start_ba = datetime.strptime(start_local_s, "%Y-%m-%d %H:%M").replace(tzinfo=BA_TZ)
+    end_ba   = start_ba + timedelta(hours=hours)
+    q_start  = to_utc_naive(start_ba)
+    q_end    = to_utc_naive(end_ba)
+
+    try:
+        rows = list(cas.query_sensor_range(s, sensor_id, q_start, q_end))
+        print(f"Total recuperado para {sensor_id} en rango: {len(rows)}")
+        if hasattr(cas, "print_measurements"):
+            cas.print_measurements(rows[:min(20, len(rows))], use_ba_time=True)
+        else:
+            for r in rows[:min(10, len(rows))]:
+                print(r)
+    except Exception as e:
+        print(f"[WARN] No se pudo listar rango insertado: {e}")
+
 
 def opt_3_mongo_create_user_and_session():
     email = ask("Email", "demo@uade.com")
     name = ask("Nombre", "Usuario Demo")
-    pwd = ask("Password (hash demo)", "pwd$demo")
+    pwd = ask("Password", "pwd$demo")
     role = ask("Rol", "usuario")
     guard(mon.bootstrap_indexes)
     uid = guard(lambda: mon.create_user(email, name, pwd, roles=[role]))
@@ -286,7 +353,7 @@ def opt_4_neo_bootstrap_seed_admin():
     rows = neo.processes_user_can_run(uid)
     neo.print_processes(rows)
 
-def opt_5_run_report_and_invoice():
+def opt_5_run_report_extremes():
     email = ask("Email usuario", "nahuel@ejemplo.com")
     name = ask("Nombre", "Usuario Prueba")
     uid = guard(lambda: mon.create_user(email, name, "pwd$cli", roles=["usuario"]))
@@ -304,14 +371,6 @@ def opt_5_run_report_and_invoice():
         print_ok("Reporte OK")
         print(f"Rango: {out['from']} → {out['to']}  días={out['days']}")
         print(f"Temp: min={out['temp_min']}  max={out['temp_max']}")
-        do_invoice = ask("¿Emitir factura? (s/n)", "s")
-        if do_invoice.lower().startswith("s"):
-            inv_id, total = mon.issue_invoice(
-                uid,
-                [{"processId": PROCESS_ID, "qty": 1, "unitPrice": PROCESS_PRICE, "amount": PROCESS_PRICE}],
-            )
-            mon.register_payment(inv_id, total, "tarjeta")
-            print_ok(f"Factura {inv_id} total=${total} (pagada)")
     else:
         print_err(f"Reporte fallido: {out.get('error')}")
 
@@ -346,37 +405,72 @@ def opt_7_neo_user_perms():
     rows = neo.processes_user_can_run(uid)
     neo.print_processes(rows)
 
-def opt_8_status():
-    print("\n== Estado ==")
+def opt_9_alertas_check():
+    print("\n=== Control y Alertas ===")
 
-    try:
-        pong = rds.r.ping()
-        print_ok(f"Redis conectado: {pong}")
-    except Exception as e:
-        print_err(f"Redis no disponible: {e}")
-
-    try:
-        mon.db.list_collection_names()
-        print_ok("Mongo conectado")
-    except Exception as e:
-        print_err(f"Mongo no disponible: {e}")
-
-    try:
+    if hasattr(cas, "get_session"):
+        s = cas.get_session()
+    else:
         s = cas.bootstrap_schema()
-        print_ok("Cassandra OK (keyspace listo)")
-    except Exception as e:
-        print_err(f"Cassandra no disponible: {e}")
 
     try:
-        neo.bootstrap_model()
-        print_ok("Neo4j OK (constraints verificados)")
-    except Exception as e:
-        print_err(f"Neo4j no disponible: {e}")
+        n_inactive = al.check_sensor_activity(s)
+        n_temp = al.check_temperature_limits(s)
+        n_hum = al.check_humidity_limits(s)
 
-def opt_9_exit():
+        n_inactive = n_inactive if isinstance(n_inactive, int) and n_inactive >= 0 else 0
+        n_temp = n_temp if isinstance(n_temp, int) and n_temp >= 0 else 0
+        n_hum = n_hum if isinstance(n_hum, int) and n_hum >= 0 else 0
+
+        print("\n--- Resultados del chequeo ---")
+        print(f"Alertas por inactividad generadas: {n_inactive}")
+        print(f"Alertas por temperatura fuera de rango: {n_temp}")
+        print(f"Alertas por humedad fuera de rango: {n_hum}")
+
+    except Exception as e:
+        print(f"[ERROR] Al ejecutar control de alertas: {e}")
+
+# menu.py
+def opt_11_listar_alertas_mongo():
+    try:
+        mon.bootstrap_indexes()
+        coll = mon.db["alerts"]  # reutilizo el handle de mongo_part
+        cur = coll.find().sort([("_id", -1)]).limit(50)
+        print("\nÚltimas alertas (MongoDB):")
+        print("-"*100)
+        for a in cur:
+            sid = a.get("sensor_id","-")
+            typ = a.get("type","-")
+            msg = a.get("description") or a.get("message","")
+            ts  = a.get("timestamp") or a.get("at","")
+            st  = a.get("status","")
+            print(f"[{st:<7}] {ts:<25} sensor={sid:<12} tipo={typ:<10} {msg}")
+    except Exception as e:
+        print(f"[ERROR] Listando alertas: {e}")
+
+
+def opt_10_run_report_averages():
+    email = ask("Email usuario", "nahuel@ejemplo.com")
+    name = ask("Nombre", "Usuario Prueba")
+    uid = guard(lambda: mon.create_user(email, name, "pwd$cli", roles=["usuario"]))
+    if not uid:
+        return
+
+    country = ask("País (ISO2)", "AR")
+    city = ask("Ciudad", "Buenos Aires")
+    year = ask("Año", now_ba().year, int)
+    month = ask("Mes (1-12)", now_ba().month, int)
+
+    out = app.run_monthly_avg_report(uid, country, city, year, month)
+    if out and out.get("ok", True):
+        print_ok("Reporte de promedios OK")
+        print(out)
+    else:
+        print_err("Reporte de promedios fallido")
+
+def opt_99_exit():
     print("\n¡Hasta la próxima!")
     sys.exit(0)
-
 
 # Usuarios / Roles
 def opt_u1_setup_roles():
@@ -416,12 +510,22 @@ def opt_s3_listar_sesiones():
 # Mensajería
 def opt_m1_crear_grupo():
     nombre = ask("Nombre del grupo", "Mantenimiento")
-    miembros = [m.strip() for m in ask("Miembros user_id (coma)", "").split(",") if m.strip()]
+    emails = [m.strip() for m in ask("Miembros email (coma)", "").split(",") if m.strip()]
+    miembros: list[str] = []
+    for e in emails:
+        try:
+            uid = _user_by_email(e)["user_id"]
+            miembros.append(uid)
+        except Exception:
+            print_err(f"⚠︎ Email no encontrado o sin user_id: {e}. Se omite.")
+    if not miembros:
+        raise ValueError("El grupo debe tener al menos un miembro válido.")
     doc = create_group(nombre, miembros)
-    print_ok(f"Grupo creado id={doc['group_id']}")
+    print_ok(f"Grupo creado id={doc['group_id']} con {len(miembros)} miembro(s)")
+
 
 def opt_m2_enviar_privado():
-    sid = ask("Session ID (del emisor)")
+    sid = ask("Session ID (del emisor)", cast=int)
     _require_perm(sid, "message:send")
     from_email = ask("Tu email (emisor)", "demo@uade.com")
     to_email = ask("Email destinatario", "usr@uade.com")
@@ -432,7 +536,7 @@ def opt_m2_enviar_privado():
     print_ok(f"Mensaje privado id={m['message_id']} enviado")
 
 def opt_m3_enviar_grupal():
-    sid = ask("Session ID (del emisor)")
+    sid = ask("Session ID (del emisor)", cast=int)
     _require_perm(sid, "message:send")
     from_email = ask("Tu email (emisor)", "demo@uade.com")
     group_id = ask("group_id (numérico)", None, int)
@@ -459,29 +563,38 @@ def opt_m5_marcar_leido():
 # Menú
 OPTIONS = [
     ("Preparar entorno (Cassandra/Mongo/Neo4j + Usuarios/Roles)", opt_1_bootstrap_all),
-    
+
+    # Usuarios / Roles
     ("Usuarios: inicializar roles base", opt_u1_setup_roles),
     ("Usuarios: crear usuario", opt_u2_crear_usuario),
     ("Usuarios: asignar rol", opt_u3_asignar_rol),
 
+    # Sesiones
     ("Sesión: login", opt_s1_login),
     ("Sesión: logout por email", opt_s2_logout),
     ("Sesión: listar activas", opt_s3_listar_sesiones),
 
+    # Mensajería
     ("Mensajes: crear grupo", opt_m1_crear_grupo),
     ("Mensajes: enviar privado", opt_m2_enviar_privado),
     ("Mensajes: enviar a grupo", opt_m3_enviar_grupal),
     ("Mensajes: ver inbox", opt_m4_ver_inbox),
     ("Mensajes: marcar como leído", opt_m5_marcar_leido),
 
-    ("Cassandra: demo (insertar y consultar)", opt_2_cassandra_demo),
-    ("Mongo: crear usuario + sesión (legacy)", opt_3_mongo_create_user_and_session),
+    # Data / Procesos
+    ("Cassandra: demo (insertar y consultar)", opt_2_cassandra),
+    ("Mongo: crear usuario + sesión (demo)", opt_3_mongo_create_user_and_session),
     ("Neo4j: bootstrap + seeds + admin", opt_4_neo_bootstrap_seed_admin),
-    ("Reporte mensual + factura", opt_5_run_report_and_invoice),
-    ("Redis: crear y ver alerta", opt_6_redis_alert_flow),
+    ("Reporte mensual (máx/mín por ciudad)", opt_5_run_report_extremes),
+    ("Reporte mensual (promedios)", opt_10_run_report_averages),
+
+    # Alertas / Estado
+    ("Redis: crear y ver alerta (demo)", opt_6_redis_alert_flow),
     ("Neo4j: listar procesos por usuario", opt_7_neo_user_perms),
-    ("Ver estado de servicios", opt_8_status),
-    ("Salir", opt_9_exit),
+    ("Ver alertas (actividad + límites)", opt_9_alertas_check),
+    ("Ver alertas guardadas (MongoDB)", opt_11_listar_alertas_mongo),
+
+    ("Salir", opt_99_exit),
 ]
 
 def main():
